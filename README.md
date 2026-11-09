@@ -1,3 +1,5 @@
+> **Maintained fork.** Fixes a file-descriptor leak that made the original stop answering after a few hours ("too many open files"), drops the pinned 2019 Docker client so it works with current Docker (29+), accepts hostnames such as `socket-proxy:2375` for tcp Docker connections, and publishes `ghcr.io/rysti0402/sui`.
+
 ## SUI
 *a startpage for your server and / or new tab page*
 

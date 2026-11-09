@@ -1,21 +1,27 @@
 package providers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	swarm "github.com/docker/docker/api/types/swarm"
-	docker "github.com/fsouza/go-dockerclient"
 	log "github.com/sirupsen/logrus"
 )
 
-////----- Constants --->
+// //----- Constants --->
 const (
-	dockerAPIVersion string = "v1.24"
+	// requests use unversioned API paths, so the daemon answers with its own
+	// current API version and no client/daemon version pinning can go stale
+	dockerRequestTimeout = 10 * time.Second
+	dockerCacheTTL       = 5 * time.Second
 )
 
 var (
@@ -27,14 +33,20 @@ var (
 
 ////----- end
 
-////----- Models --->
+// //----- Models --->
 type Docker struct {
 	Host       string
-	Client     *docker.Client
+	Client     *http.Client
+	BaseURL    string
 	User       string
 	Pass       string
 	DefaultEnb bool
 	Swarm      bool
+
+	cacheMu    sync.Mutex
+	cacheTime  time.Time
+	containers []dockerContainer
+	services   []dockerService
 }
 type DockerConfig struct {
 	ConnType   string `json:"connection"`
@@ -45,25 +57,30 @@ type DockerConfig struct {
 	DefaultEnb bool   `json:"default"`
 	Swarm      bool   `json:"swarm"`
 }
-type DockerContainerInfo struct {
-	ID    string   `json:"Id"`
-	Names []string `json:"Names"`
-	Image string   `json:"Image"`
-	//State  string            `json:"State"`
+type dockerContainer struct {
+	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
+	Image  string            `json:"Image"`
 	Labels map[string]string `json:"Labels"`
 }
-type DockerContainerConfig struct {
-	Labels map[string]string `json:"Labels"`
+type dockerService struct {
+	Spec struct {
+		Name         string `json:"Name"`
+		TaskTemplate struct {
+			ContainerSpec struct {
+				Labels map[string]string `json:"Labels"`
+			} `json:"ContainerSpec"`
+		} `json:"TaskTemplate"`
+	} `json:"Spec"`
 }
-type DockerIndividualInfo struct {
-	ID     string                `json:"Id"`
-	Name   string                `json:"Names"`
-	Config DockerContainerConfig `json:"Config"`
+type dockerVersion struct {
+	Version    string `json:"Version"`
+	APIVersion string `json:"ApiVersion"`
 }
 
 ////----- end
 
-////----- Common App Provider Functions --->
+// //----- Common App Provider Functions --->
 func newDocker(name string) (*Docker, error) {
 	log.Debugf("creating new docker provider")
 	config, err := loadDockerConfig(name)
@@ -77,7 +94,7 @@ func newDocker(name string) (*Docker, error) {
 		Swarm:      config.Swarm,
 		DefaultEnb: config.DefaultEnb,
 	}
-	docker.Client, err = config.createClient()
+	docker.Client, docker.BaseURL, err = config.createClient()
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +146,7 @@ func (dkr *Docker) UpgradeApp(matchName string, app *App) (string, bool) {
 func (dkr *Docker) TestConnection(output bool) bool {
 	version, err := dkr.getDockerVersion()
 	if err != nil {
+		log.Errorf("docker connection test failed | %v", err)
 		return false
 	}
 	log.Debugf("docker version checked | %s", version)
@@ -154,7 +172,7 @@ func loadDockerConfig(name string) (*DockerConfig, error) {
 
 ////----- end
 
-////----- Provider Specific ---> eof
+// //----- Provider Specific ---> eof
 func newDockerConfig() *DockerConfig {
 	return &DockerConfig{
 		ConnPath: "/var/run/docker.sock",
@@ -165,28 +183,85 @@ func newDockerConfig() *DockerConfig {
 	}
 }
 
-func (cnf *DockerConfig) createClient() (*docker.Client, error) {
-	var path string
-	if strings.ToLower(cnf.ConnType) == "unix" {
+// createClient builds one reusable http client for the docker api, either over
+// the unix socket or tcp. Returns the client and the base url to request against
+func (cnf *DockerConfig) createClient() (*http.Client, string, error) {
+	transport := &http.Transport{
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	switch strings.ToLower(cnf.ConnType) {
+	case "unix":
 		if !cnf.dockerSocketExist() {
-			log.Errorf("you must mount the docker socket (%s) to use unix type", path)
-			return nil, fmt.Errorf("docker socket is not mounted (correctly)")
+			log.Errorf("you must mount the docker socket (%s) to use unix type", cnf.ConnPath)
+			return nil, "", fmt.Errorf("docker socket is not mounted (correctly)")
 		}
-		path = fmt.Sprintf("%s://%s", strings.ToLower(cnf.ConnType), cnf.ConnPath)
-	} else if strings.ToLower(cnf.ConnType) == "tcp" {
+		socket := cnf.ConnPath
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socket)
+		}
+		return &http.Client{Transport: transport, Timeout: dockerRequestTimeout}, "http://docker", nil
+	case "tcp":
 		if !cnf.dockerTCPOkay() {
-			log.Errorf("you must enter a valid [ip]:[port] to use tcp type docker")
-			return nil, fmt.Errorf("docker host is not valid")
+			log.Errorf("you must enter a valid [host]:[port] to use tcp type docker")
+			return nil, "", fmt.Errorf("docker host is not valid")
 		}
-		path = fmt.Sprintf("%s://%s", strings.ToLower(cnf.ConnType), cnf.ConnURL)
-	} else {
-		return nil, fmt.Errorf("type must be unix or tcp | given -> %s", cnf.ConnType)
+		return &http.Client{Transport: transport, Timeout: dockerRequestTimeout}, "http://" + cnf.ConnURL, nil
+	default:
+		return nil, "", fmt.Errorf("type must be unix or tcp | given -> %s", cnf.ConnType)
 	}
-	dkrClient, err := docker.NewClient(path)
+}
+
+// request performs a GET against the docker api and decodes the json response
+// into out. The response body is always drained and closed so connections are
+// reused instead of leaked
+func (dkr *Docker) request(path string, out interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, dkr.BaseURL+path, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return dkrClient, nil
+	if dkr.User != "" {
+		req.SetBasicAuth(dkr.User, dkr.Pass)
+	}
+	resp, err := dkr.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("docker api %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	err = json.NewDecoder(resp.Body).Decode(out)
+	io.Copy(io.Discard, resp.Body)
+	return err
+}
+
+// refreshCache fetches containers (or services) at most once per dockerCacheTTL,
+// so the traefik provider can match many routers without one api call each
+func (dkr *Docker) refreshCache() error {
+	dkr.cacheMu.Lock()
+	defer dkr.cacheMu.Unlock()
+	if time.Since(dkr.cacheTime) < dockerCacheTTL {
+		return nil
+	}
+	if dkr.Swarm {
+		var services []dockerService
+		if err := dkr.request("/services", &services); err != nil {
+			return err
+		}
+		dkr.services = services
+	} else {
+		var containers []dockerContainer
+		if err := dkr.request("/containers/json", &containers); err != nil {
+			return err
+		}
+		dkr.containers = containers
+	}
+	dkr.cacheTime = time.Now()
+	return nil
 }
 
 func (dkr *Docker) dockerGetApps() map[string]*App {
@@ -198,10 +273,7 @@ func (dkr *Docker) dockerGetApps() map[string]*App {
 	for _, container := range containers {
 		app := newApp()
 		app.Enabled = dkr.DefaultEnb
-		var name string
-		if len(container.Names) > 0 {
-			name = container.Names[0][1:]
-		}
+		name := containerName(container)
 		newName, upName := dkr.UpgradeApp(name, app)
 		if upName {
 			name = newName
@@ -231,10 +303,8 @@ func (dkr *Docker) swarmGetApps() map[string]*App {
 			name = newName
 		}
 		if app.Enabled {
-			
 			app.formatDisplayURL(maxDisplayURLLen)
 			app.formatDisplayName(name, maxDisplayNameLen)
-
 			apps[name] = app
 		}
 	}
@@ -247,29 +317,8 @@ func (dkr *Docker) dockerUpgradeApp(matchName string, app *App) (string, bool) {
 		return "", false
 	}
 	for _, info := range containers {
-		if len(info.Names) != 0 && info.Names[0][1:] == matchName {
-			lIcon, icex := info.Labels[dockerIconLabel]
-			lURL, urlex := info.Labels[dockerURLLabel]
-			lEnab, enabex := info.Labels[dockerEnabledLabel]
-
-			if icex {
-				app.Icon = lIcon
-			}
-			if urlex {
-				app.URL = lURL
-			}
-			if enabex {
-				lEnabB, err := strconv.ParseBool(lEnab)
-				if err == nil {
-					app.Enabled = lEnabB
-				} else {
-					enabex = false
-				}
-			}
-			lName, namex := info.Labels[dockerNameLabel]
-			if namex {
-				return lName, true
-			}
+		if containerName(info) == matchName {
+			return applyLabels(info.Labels, app)
 		}
 	}
 	return "", false
@@ -282,31 +331,37 @@ func (dkr *Docker) swarmUpgradeApp(matchName string, app *App) (string, bool) {
 	}
 	for _, info := range services {
 		if strings.ToLower(info.Spec.Name) == matchName {
-			lIcon, icex := info.Spec.TaskTemplate.ContainerSpec.Labels[dockerIconLabel]
-			lURL, urlex := info.Spec.TaskTemplate.ContainerSpec.Labels[dockerURLLabel]
-			lEnab, enabex := info.Spec.TaskTemplate.ContainerSpec.Labels[dockerEnabledLabel]
-
-			if icex {
-				app.Icon = lIcon
-			}
-			if urlex {
-				app.URL = lURL
-			}
-			if enabex {
-				lEnabB, err := strconv.ParseBool(lEnab)
-				if err == nil {
-					app.Enabled = lEnabB
-				} else {
-					enabex = false
-				}
-			}
-			lName, namex := info.Spec.TaskTemplate.ContainerSpec.Labels[dockerNameLabel]
-			if namex {
-				return lName, true
-			}
+			return applyLabels(info.Spec.TaskTemplate.ContainerSpec.Labels, app)
 		}
 	}
 	return "", false
+}
+
+// applyLabels copies sui.* labels onto the app
+// Returns the sui.name label and true if one was set
+func applyLabels(labels map[string]string, app *App) (string, bool) {
+	if lIcon, ok := labels[dockerIconLabel]; ok {
+		app.Icon = lIcon
+	}
+	if lURL, ok := labels[dockerURLLabel]; ok {
+		app.URL = lURL
+	}
+	if lEnab, ok := labels[dockerEnabledLabel]; ok {
+		if lEnabB, err := strconv.ParseBool(lEnab); err == nil {
+			app.Enabled = lEnabB
+		}
+	}
+	if lName, ok := labels[dockerNameLabel]; ok {
+		return lName, true
+	}
+	return "", false
+}
+
+func containerName(c dockerContainer) string {
+	if len(c.Names) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(c.Names[0], "/")
 }
 
 func (cnf *DockerConfig) dockerSocketExist() bool {
@@ -316,49 +371,45 @@ func (cnf *DockerConfig) dockerSocketExist() bool {
 	return false
 }
 
+// dockerTCPOkay accepts host:port where host is an ip or a hostname
+// (e.g. socket-proxy:2375)
 func (cnf *DockerConfig) dockerTCPOkay() bool {
-	parts := strings.Split(cnf.ConnURL, ":")
-	log.Infoln(parts)
-	if len(parts) != 2 {
+	host, port, err := net.SplitHostPort(cnf.ConnURL)
+	if err != nil || host == "" {
 		return false
 	}
-	ip := net.ParseIP(parts[0])
-	if ip != nil {
-		_, err := strconv.ParseInt(parts[1], 10, 32)
-		if err == nil {
-			return true
-		}
-	}
-	return false
+	p, err := strconv.Atoi(port)
+	return err == nil && p > 0 && p < 65536
 }
 
-func (dkr *Docker) getContainerList() ([]docker.APIContainers, error) {
-	containerList, err := dkr.Client.ListContainers(docker.ListContainersOptions{})
-	if err != nil {
-		log.Errorf("failed to fetch docker container list")
+func (dkr *Docker) getContainerList() ([]dockerContainer, error) {
+	if err := dkr.refreshCache(); err != nil {
+		log.Errorf("failed to fetch docker container list | %v", err)
 		return nil, err
 	}
-	return containerList, nil
+	dkr.cacheMu.Lock()
+	defer dkr.cacheMu.Unlock()
+	return dkr.containers, nil
 }
 
-func (dkr *Docker) getServiceList() ([]swarm.Service, error) {
-	services, err := dkr.Client.ListServices(docker.ListServicesOptions{})
-	if err != nil {
-		log.Errorf("failed to fetch docker services list")
+func (dkr *Docker) getServiceList() ([]dockerService, error) {
+	if err := dkr.refreshCache(); err != nil {
+		log.Errorf("failed to fetch docker services list | %v", err)
 		return nil, err
 	}
-	return services, nil
+	dkr.cacheMu.Lock()
+	defer dkr.cacheMu.Unlock()
+	return dkr.services, nil
 }
 
 func (dkr *Docker) getDockerVersion() (string, error) {
-	versionData, err := dkr.Client.Version()
-	if err != nil {
+	var versionData dockerVersion
+	if err := dkr.request("/version", &versionData); err != nil {
 		log.Errorf("failed to fetch docker version")
 		return "", err
 	}
-	version := versionData.Get("Version")
-	if version == "" {
+	if versionData.Version == "" {
 		return "", fmt.Errorf("docker version info not found")
 	}
-	return version, nil
+	return fmt.Sprintf("%s (api %s)", versionData.Version, versionData.APIVersion), nil
 }

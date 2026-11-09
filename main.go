@@ -45,17 +45,28 @@ func main() {
 	r.HandleFunc("/", serveIndex)
 	r.HandleFunc("/js/search.js", serveSearchJS)
 
-	http.ListenAndServe(":6999", r)
+	srv := &http.Server{
+		Addr:              ":6999",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
+// addAppProviders skips (rather than crashes on) a provider that cannot be
+// reached at startup, so one unavailable backend doesn't take the page down
 func addAppProviders() {
-	var err error
 	for _, provider := range config.GetAppProviderConfigs() {
 		log.Debugf("adding provider | %s", provider.Name)
-		indexData.AppProviders[provider.Name], err = providers.NewAppProvider(provider.Name, provider.PType)
+		prov, err := providers.NewAppProvider(provider.Name, provider.PType)
 		if err != nil {
-			panic(err)
+			log.Errorf("provider unavailable, skipping | %s | %v", provider.Name, err)
+			continue
 		}
+		indexData.AppProviders[provider.Name] = prov
 	}
 
 }
@@ -75,11 +86,11 @@ func addBookmarks() {
 
 
 func refreshApps() {
-	for true {
+	for {
 		for name, prov := range indexData.AppProviders {
-			err := prov.RefreshApps()
-			if err != nil {
-				panic(err)
+			if err := prov.RefreshApps(); err != nil {
+				log.Errorf("refresh failed | provider: %s | %v", name, err)
+				continue
 			}
 			log.Debugf("found apps | provider: %s | app count: %d", name, len(prov.Apps))
 		}

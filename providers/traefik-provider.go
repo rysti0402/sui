@@ -3,11 +3,13 @@ package providers
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
-	"github.com/containous/traefik/v2/pkg/rules"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -103,11 +105,7 @@ func (tr *Traefik) GetApps() map[string]*App {
 		}
 		app.Icon = getDefaultIcon(name)
 		if router.RuleStr != "" {
-			domainStrs, err := rules.ParseDomains(router.RuleStr)
-			if err != nil {
-				log.Errorf("failed to parse traefik router domain")
-				continue
-			}
+			domainStrs := parseDomains(router.RuleStr)
 			if len(domainStrs) > 0 {
 				app.URL = domainStrs[0]
 			}
@@ -168,44 +166,67 @@ func newTraefikConfig() *TraefikConfig {
 	return &TraefikConfig{}
 }
 
-func (tr *Traefik) requestFromTraefik(path string) (*http.Response, error) {
-	//TODO: support non localhost hosts....
-	path = fmt.Sprintf("%s/%s", tr.URL, path)
-	req, err := http.NewRequest("GET", path, nil)
+// traefikClient is shared by every request so idle connections are reused,
+// and the timeout stops a stalled traefik api from hanging the refresh loop
+var traefikClient = &http.Client{Timeout: 10 * time.Second}
+
+// getJSON performs a GET against the traefik api and decodes the json response
+// into out. The response body is always drained and closed so the underlying
+// connection is released (the original code never closed it and leaked a file
+// descriptor on every refresh)
+func (tr *Traefik) getJSON(path string, out interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/%s", tr.URL, path), nil)
+	if err != nil {
+		return err
+	}
 	if tr.User != "" {
 		req.SetBasicAuth(tr.User, tr.Pass)
 	}
-	client := &http.Client{}
-	response, err := client.Do(req)
-	return response, err
+	resp, err := traefikClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	defer io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("traefik api %s returned %d", path, resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func (tr *Traefik) getRouterList() ([]*TraefikRouter, error) {
-	response, err := tr.requestFromTraefik(traefikRoutersPath)
-	if err != nil || response.StatusCode != 200 {
-		log.Errorf("failed to fetch traefik router list")
-		return nil, err
-	}
 	var routerList []*TraefikRouter
-	err = json.NewDecoder(response.Body).Decode(&routerList)
-	if err != nil {
-		log.Errorf("traefik router list could not be parsed")
+	if err := tr.getJSON(traefikRoutersPath, &routerList); err != nil {
+		log.Errorf("failed to fetch traefik router list | %v", err)
 		return nil, err
 	}
 	return routerList, nil
 }
 
 func (tr *Traefik) getTraefikVersion() (*TraefikVersion, error) {
-	response, err := tr.requestFromTraefik("api/version")
-	if err != nil || response.StatusCode != 200 {
-		log.Errorf("failed to fetch traefik version")
+	var versionInfo TraefikVersion
+	if err := tr.getJSON("api/version", &versionInfo); err != nil {
+		log.Errorf("failed to fetch traefik version | %v", err)
 		return nil, err
 	}
-	var versionInfo *TraefikVersion
-	err = json.NewDecoder(response.Body).Decode(&versionInfo)
-	if err != nil {
-		log.Errorf("traefik version info could not be parsed\n")
-		return nil, err
+	return &versionInfo, nil
+}
+
+var (
+	// Host(...) but not HostRegexp(...) or HostSNI(...)
+	hostMatcherRe = regexp.MustCompile(`\bHost\(([^)]*)\)`)
+	// a backtick, double or single quoted argument
+	hostArgRe = regexp.MustCompile("[`\"']([^`\"']+)[`\"']")
+)
+
+// parseDomains returns the domains named in Host() matchers of a traefik rule,
+// for both v2 (Host(`a`, `b`)) and v3 (Host(`a`) || Host(`b`)) syntax
+func parseDomains(rule string) []string {
+	var domains []string
+	for _, m := range hostMatcherRe.FindAllStringSubmatch(rule, -1) {
+		for _, arg := range hostArgRe.FindAllStringSubmatch(m[1], -1) {
+			domains = append(domains, strings.ToLower(strings.TrimSpace(arg[1])))
+		}
 	}
-	return versionInfo, nil
+	return domains
 }
